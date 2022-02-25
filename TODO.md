@@ -19,12 +19,10 @@ _This todo list describes ChrisAnt996's current intended roadmap for Clink's fut
 - `{ "-x" }` -> one is flag.
 - `{ "-x", "Does a thing" }` -> two are flag, description.
 - `{ "-x", "NUM", "Does a thing" }` -> three are flag, display, description.
-- `{ disp="text" }` -> `disp` is synonym for `display`.
-- `{ desc="text" }` -> `desc` is synonym for `description`.
 - `{ "-x", display="text" }` -> first is flag, etc.
 - `withflag` groups with named flag; the description for all is taken from the first with a description.
 - `withprev` groups with preceding flag; the description for all is taken from the first with a description.
-- `hide` hides the flag, but still recognizes it.
+- `hide` hides the flag, but still recognizes it (for linked argmatchers, and when coloring the input line).
 - Grouping flags lists them on the same line.
   - Hard limit?
   - Drop extras that "don't fit"?
