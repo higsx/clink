@@ -13,6 +13,18 @@ _This todo list describes ChrisAnt996's current intended roadmap for Clink's fut
     - [ ] Always insert the first flag listed in a line.
   - [ ] Easier argmatcher syntax for defining flags + display + description strings.
   - [ ] Provide shim so scripts can use new syntax and still be compatible with older Clink.
+- [ ] Re: [#101](https://github.com/chrisant996/clink/issues/101); mechanism to dynamically extend or reset an argmatcher.
+  - [ ] Add `argmatcher:clear()` (or `reset()`?) to reset an argmatcher back to an empty state.
+  - [ ] Add a way to specify a callback for the first time the argmatcher is used after a new edit line (minimizes perf cost).
+    - Can reset an argmatcher, e.g. based on cwd changing.
+    - Can delay-initialize the argmatcher.
+    - Always use a coroutine to run the callback?
+    - `argmatcher:onupdate(callback)`?
+  - [ ] Add a way for an argument slot to delay-initialize itself.
+    - Called only once.
+    - Returned values are added to the argument slot's matches.
+    - Always use a coroutine to run the callback?
+    - `delayinit=callback`?
 
 ## Argmatcher syntax
 - `{ flag="-x", display="NUM", description="Does a thing with NUM", withflag="-y", withprev=true, hide=true }`
