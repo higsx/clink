@@ -30,7 +30,6 @@ int input_echo(int argc, char** argv)
             verbose_input = true;
     }
 
-    extern void set_verbose_input(bool verbose);
     set_verbose_input(verbose_input);
 
     puts("Type a key to see its key sequence string.\nPress Ctrl+C when finished.");
@@ -42,7 +41,11 @@ int input_echo(int argc, char** argv)
     app_context::get()->get_default_settings_file(default_settings_file);
     settings::load(settings_file.c_str(), default_settings_file.c_str());
 
+#ifdef TEST_MOUSE_INPUT
+    console_config cc(nullptr, true);
+#else
     console_config cc;
+#endif
 
     terminal terminal = terminal_create();
     terminal_in& input = *terminal.in;
@@ -70,6 +73,8 @@ int input_echo(int argc, char** argv)
                 printf("\\x%02x", unsigned(c));
             else if (c == 0x1b)
                 printf("\\e");
+            else if (c == 0x7f)
+                printf("Rubout");
             else if (c < 0x20)
                 printf("\\C-%c", c|0x40);
             else

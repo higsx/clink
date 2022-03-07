@@ -12,6 +12,7 @@
 #include <core/base.h>
 #include <core/str.h>
 #include <core/str_iter.h>
+#include <core/str_hash.h>
 #include <core/settings.h>
 
 #ifdef DEBUG
@@ -19,15 +20,21 @@
 #endif
 
 #include <assert.h>
-#include <map>
+#include <unordered_map>
 
 //------------------------------------------------------------------------------
 setting_bool g_terminal_raw_esc(
     "terminal.raw_esc",
     "Esc sends a literal escape character",
-    "When enabled, pressing Esc sends a literal escape character like in Unix/etc\n"
-    "terminals.  This setting is disabled by default to provide a more predictable,\n"
-    "reliable, and configurable input experience on Windows.\n"
+    "When disabled (the default), pressing Esc or Alt+[ or Alt+Shift+O send unique\n"
+    "key sequences to provide a predictable, reliable, and configurable input\n"
+    "experience.  Use 'clink echo' to find the key sequences.\n"
+    "\n"
+    "When this setting is enabled, then pressing those keys sends the same key\n"
+    "sequences as in Unix/etc.  However, they are ambiguous and conflict with the\n"
+    "beginning of many other key sequences, leading to surprising or confusing\n"
+    "input situations."
+    "\n"
     "Changing this only affects future Clink sessions, not the current session.",
     false);
 
@@ -54,7 +61,7 @@ extern setting_enum g_default_bindings;
 extern "C" void reset_wcwidths();
 extern "C" int is_locked_cursor();
 extern HANDLE get_recognizer_event();
-extern void host_reclassify();
+extern void host_refresh_recognizer();
 
 //------------------------------------------------------------------------------
 static const int CTRL_PRESSED = LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED;
@@ -80,6 +87,8 @@ static const char* const knp[]   = { CSI(6~), CSI(6;2~), CSI(6;5~), CSI(6;6~), C
 static const char* const kbks[]  = { "\b",    MOK(2;8),  "\x7f",    MOK(6;8),  "\x1b\b",  MOK(4;8),  "\x1b\x7f",MOK(8;8)  }; // bkspc
 static const char* const kret[]  = { "\r",    MOK(2;13), MOK(5;13), MOK(6;13), MOK(3;13), MOK(4;13), MOK(7;13), MOK(8;13) }; // enter (return)
 static const char* const kcbt    = CSI(Z);
+static const char* const kaltO   = CSI(27;4;79~);
+static const char* const kaltlb  = CSI(27;3;91~);
 static const char* const kfx[]   = {
     // kf1-12 : Fx unmodified
     SS3(P),     SS3(Q),     SS3(R),     SS3(S),
@@ -205,10 +214,10 @@ inline bool is_lead_surrogate(unsigned int ch) { return IN_RANGE(0xD800, ch, 0xD
 
 
 //------------------------------------------------------------------------------
-static bool s_verbose_input = false;
-void set_verbose_input(bool verbose)
+static char s_verbose_input = false;
+void set_verbose_input(int verbose)
 {
-    s_verbose_input = verbose;
+    s_verbose_input = char(verbose);
 }
 
 
@@ -229,12 +238,24 @@ struct keyseq_name : public no_copy
 //------------------------------------------------------------------------------
 struct keyseq_key : public no_copy
 {
-    keyseq_key(const char* p, bool find = false) { this->s = p; this->find = find; }
-    keyseq_key(keyseq_key&& a) { s = a.s; find = a.find; a.s = nullptr; }
-    keyseq_key& operator=(keyseq_key&& a) { s = a.s; find = a.find; a.s = nullptr; return *this; }
+    keyseq_key(const char* p, unsigned int find_len=0) { this->s = p; this->find_len = find_len; }
+    keyseq_key(keyseq_key&& a) { s = a.s; find_len = a.find_len; a.s = nullptr; }
+    keyseq_key& operator=(keyseq_key&& a) { s = a.s; find_len = a.find_len; a.s = nullptr; return *this; }
 
     const char* s;
-    bool find;
+    unsigned int find_len;
+};
+
+//------------------------------------------------------------------------------
+struct keyseq_hasher
+{
+    size_t operator()(const keyseq_key& lookup) const
+    {
+        unsigned int find_len = lookup.find_len;
+        if (!find_len)
+            find_len = static_cast<unsigned int>(strlen(lookup.s));
+        return str_hash(lookup.s, find_len);
+    }
 };
 
 //------------------------------------------------------------------------------
@@ -242,26 +263,28 @@ struct map_cmp_str
 {
     bool operator()(keyseq_key const& a, keyseq_key const& b) const
     {
-        if (a.find)
+        if (a.find_len)
         {
-            assert(!b.find);
+            assert(!b.find_len);
             const char* bs = b.s;
-            for (const char* as = a.s; *as; as++, bs++)
+            unsigned int len = a.find_len;
+            for (const char* as = a.s; len--; as++, bs++)
             {
                 int cmp = int((unsigned char)*as) - int((unsigned char)*bs);
                 if (cmp)
-                    return cmp < 0;
+                    return false;
             }
         }
-        else if (b.find)
+        else if (b.find_len)
         {
-            assert(!a.find);
+            assert(!a.find_len);
             const char* as = a.s;
-            for (const char* bs = b.s; *bs; as++, bs++)
+            unsigned int len = b.find_len;
+            for (const char* bs = b.s; len--; as++, bs++)
             {
                 int cmp = int((unsigned char)*as) - int((unsigned char)*bs);
                 if (cmp)
-                    return cmp < 0;
+                    return false;
             }
         }
         else
@@ -271,16 +294,18 @@ struct map_cmp_str
             while (true)
             {
                 int cmp = int((unsigned char)*as) - int((unsigned char)*bs);
-                if (cmp || !*as)
-                    return cmp < 0;
+                if (cmp)
+                    return false;
+                if (!*as)
+                    break;
                 as++;
                 bs++;
             }
         }
-        return false;
+        return true;
     }
 };
-static std::map<keyseq_key, keyseq_name, map_cmp_str> map_keyseq_to_name;
+static std::unordered_map<keyseq_key, keyseq_name, keyseq_hasher, map_cmp_str> map_keyseq_to_name;
 static char map_keyseq_differentiate = -1;
 static int map_default_bindings = -1;
 
@@ -363,6 +388,12 @@ static void ensure_keyseqs_to_names()
         add_keyseq_to_name("\x0d", "Enter", builder, 0);
     }
 
+    if (!g_terminal_raw_esc.get())
+    {
+        add_keyseq_to_name("\x1b[27;3;91~", "A-[", builder, 0);
+        add_keyseq_to_name("\x1b[27;4;79~", "A-S-O", builder, 0);
+    }
+
     if (!map_keyseq_differentiate)
     {
         remove_keyseq_from_name(terminfo::kbks[4]);
@@ -390,9 +421,9 @@ void reset_keyseq_to_name_map()
 }
 
 //------------------------------------------------------------------------------
-static bool key_name_from_vk(int key_vk, str_base& out)
+static bool key_name_from_vk(int key_vk, str_base& out, int scan=0)
 {
-    UINT key_scan = MapVirtualKeyW(key_vk, MAPVK_VK_TO_VSC);
+    UINT key_scan = scan ? scan : MapVirtualKeyW(key_vk, MAPVK_VK_TO_VSC);
     if (key_scan)
     {
         LONG l = (key_scan & 0x01ff) << 16;
@@ -415,16 +446,20 @@ const char* find_key_name(const char* keyseq, int& len, int& eqclass, int& order
     if (!keyseq || !*keyseq)
         return nullptr;
 
-    // Look up the sequence in the special key names map.
+    // Look up the sequence in the special key names map.  Finds the longest
+    // matching key name (in case of non-unique names existing).
     ensure_keyseqs_to_names();
-    keyseq_key lookup(keyseq, true/*find*/);
-    auto const& iter = map_keyseq_to_name.find(lookup);
-    if (iter != map_keyseq_to_name.end())
+    for (unsigned int find_len = min<unsigned int>(16, static_cast<unsigned int>(strlen(keyseq))); find_len; --find_len)
     {
-        len = (int)strlen(iter->first.s);
-        eqclass = iter->second.eq;
-        order = iter->second.o - (int)map_keyseq_to_name.size();
-        return iter->second.s;
+        keyseq_key lookup(keyseq, find_len);
+        auto const& iter = map_keyseq_to_name.find(lookup);
+        if (iter != map_keyseq_to_name.end())
+        {
+            len = (int)strlen(iter->first.s);
+            eqclass = iter->second.eq;
+            order = iter->second.o - (int)map_keyseq_to_name.size();
+            return iter->second.s;
+        }
     }
 
     // Try to deduce the name if it's an extended XTerm key sequence.
@@ -657,7 +692,7 @@ void win_terminal_in::read_console(input_idle* callback)
             }
 
             if (waited == recognizer_waited)
-                host_reclassify();
+                host_refresh_recognizer();
             else
                 callback->on_idle();
 
@@ -719,60 +754,35 @@ static void verbose_input(KEY_EVENT_RECORD const& record)
     char buf[32];
     buf[0] = 0;
     str_base tmps(buf);
-    const char* key_name = key_name_from_vk(key_vk, tmps) ? buf : "UNKNOWN";
+    const char* key_name = key_name_from_vk(key_vk, tmps, key_sc) ? buf : "UNKNOWN";
 
+    const char* dead = "";
 #if defined(USE_TOUNICODE_FOR_DEADKEYS)
+    // NOT VIABLE:
+    //  - Is destructive; it alters the internal keyboard state.
+    //  - It doesn't detect dead keys anyway.
+    str<> tmp;
     static const char* const maybe_newline = "";
     int tu = 0;
-    WCHAR wbuf[33] = {};
+    char tmp2[33];
+    WCHAR wbuf[33];
     BYTE keystate[256];
+    tmp2[0] = '\0';
     if (GetKeyboardState(keystate))
     {
-        // NOT VIABLE:
-        //  - Is destructive; it alters the internal keyboard state.
-        //  - It doesn't detect dead keys anyway.
+        wbuf[0] = '\0';
         tu = ToUnicode(key_vk, key_sc, keystate, wbuf, sizeof_array(wbuf) - 1, 2);
         if (tu >= 0)
             wbuf[tu] = '\0';
+        to_utf8(str_base(tmp2), wbuf);
     }
-#elif defined(USE_MAPVIRTUALKEY_FOR_DEADKEYS)
-    static const char* const maybe_newline = "";
-#else
-    static const char* const maybe_newline = "\n";
-#endif
-
-    printf("key event:  %c%c%c %c%c  flags=0x%08.8x  char=0x%04.4x  vk=0x%04.4x  scan=0x%04.4x  \"%s\"%s",
-            (key_flags & SHIFT_PRESSED) ? 'S' : '_',
-            (key_flags & LEFT_CTRL_PRESSED) ? 'C' : '_',
-            (key_flags & LEFT_ALT_PRESSED) ? 'A' : '_',
-            (key_flags & RIGHT_ALT_PRESSED) ? 'A' : '_',
-            (key_flags & RIGHT_CTRL_PRESSED) ? 'C' : '_',
-            key_flags,
-            key_char,
-            key_vk,
-            key_sc,
-            key_name,
-            maybe_newline);
-
-#if defined(USE_TOUNICODE_FOR_DEADKEYS)
     if (tu == 0)
-    {
-        printf("  (unknown key)");
-    }
+        tmp << "  (unknown key)";
+    else if (tu < 0)
+        tmp << "  dead key \"" << tmp2 << "\"";
     else
-    {
-        if (tu < 0)
-            printf("  dead key \"");
-        else
-            printf("  ToUnicode \"");
-
-        DWORD written;
-        WriteConsoleW(m_stdout, wbuf, int(wcslen(wbuf)), &written, nullptr);
-
-        printf("\"");
-    }
-
-    puts("");
+        tmp << "  ToUnicode \"" << tmp2 << "\"";
+    dead = tmp.c_str();
 #elif defined(USE_MAPVIRTUALKEY_FOR_DEADKEYS)
     // CLOSE...BUT NOT VIABLE:
     //  - Always uses the keyboard input layout from when the process
@@ -786,11 +796,29 @@ static void verbose_input(KEY_EVENT_RECORD const& record)
     // The second issue could be accommodated by only checking if the input
     // was not translatable into text.  But it doesn't use the current
     // keyboard layout, so it's unreliable.
+    str<> tmp;
     if (INT(MapVirtualKeyW(key_vk, MAPVK_VK_TO_CHAR)) < 0)
-        printf("  (dead key)");
-
-    puts("");
+        tmp << "  (dead key)";
+    dead = tmp.c_str();
 #endif
+
+    const char* pro = (s_verbose_input > 1) ? "\x1b[s\x1b[H" : "";
+    const char* epi = (s_verbose_input > 1) ? "\x1b[K\x1b[u" : "\n";
+
+    printf("%skey event:  %c%c%c %c%c  flags=0x%08.8x  char=0x%04.4x  vk=0x%04.4x  scan=0x%04.4x  \"%s\"%s%s",
+            pro,
+            (key_flags & SHIFT_PRESSED) ? 'S' : '_',
+            (key_flags & LEFT_CTRL_PRESSED) ? 'C' : '_',
+            (key_flags & LEFT_ALT_PRESSED) ? 'A' : '_',
+            (key_flags & RIGHT_ALT_PRESSED) ? 'A' : '_',
+            (key_flags & RIGHT_CTRL_PRESSED) ? 'C' : '_',
+            key_flags,
+            key_char,
+            key_vk,
+            key_sc,
+            key_name,
+            dead,
+            epi);
 }
 
 //------------------------------------------------------------------------------
@@ -901,6 +929,17 @@ void win_terminal_in::process_input(KEY_EVENT_RECORD const& record)
     {
         bool simple_char;
 
+        if (key_char == 'O' && !g_terminal_raw_esc.get() && !(key_flags & CTRL_PRESSED) && (key_flags & SHIFT_PRESSED) && (key_flags & ALT_PRESSED))
+        {
+            push(terminfo::kaltO);
+            return;
+        }
+        if (key_char == '[' && !g_terminal_raw_esc.get() && !(key_flags & (CTRL_PRESSED|SHIFT_PRESSED)) && (key_flags & ALT_PRESSED))
+        {
+            push(terminfo::kaltlb);
+            return;
+        }
+
         assert(key_vk != VK_TAB);
         if (key_vk == 'H' || key_vk == 'I')
             simple_char = !(key_flags & CTRL_PRESSED) || !g_differentiate_keys.get();
@@ -921,54 +960,24 @@ void win_terminal_in::process_input(KEY_EVENT_RECORD const& record)
         }
     }
 
-    // The numpad keys such as PgUp, End, etc. don't come through with the
-    // ENHANCED_KEY flag set so we'll infer it here.
+    const char* const* seqs = nullptr;
     switch (key_vk)
     {
-    case VK_UP:
-    case VK_DOWN:
-    case VK_LEFT:
-    case VK_RIGHT:
-    case VK_HOME:
-    case VK_END:
-    case VK_INSERT:
-    case VK_DELETE:
-    case VK_PRIOR:
-    case VK_NEXT:
-    case VK_BACK:
-        key_flags |= ENHANCED_KEY;
-        break;
-    };
-
-    // Convert enhanced keys to normal mode xterm compatible escape sequences.
-    if (key_flags & ENHANCED_KEY)
+    case VK_UP:     seqs = terminfo::kcuu1; break;  // up
+    case VK_DOWN:   seqs = terminfo::kcud1; break;  // down
+    case VK_LEFT:   seqs = terminfo::kcub1; break;  // left
+    case VK_RIGHT:  seqs = terminfo::kcuf1; break;  // right
+    case VK_HOME:   seqs = terminfo::khome; break;  // insert
+    case VK_END:    seqs = terminfo::kend; break;   // delete
+    case VK_INSERT: seqs = terminfo::kich1; break;  // home
+    case VK_DELETE: seqs = terminfo::kdch1; break;  // end
+    case VK_PRIOR:  seqs = terminfo::kpp; break;    // pgup
+    case VK_NEXT:   seqs = terminfo::knp; break;    // pgdn
+    case VK_BACK:   seqs = terminfo::kbks; break;   // bkspc
+    }
+    if (seqs)
     {
-        static const struct {
-            int                 code;
-            const char* const*  seqs;
-        } sc_map[] = {
-            { 'H', terminfo::kcuu1, }, // up
-            { 'P', terminfo::kcud1, }, // down
-            { 'K', terminfo::kcub1, }, // left
-            { 'M', terminfo::kcuf1, }, // right
-            { 'R', terminfo::kich1, }, // insert
-            { 'S', terminfo::kdch1, }, // delete
-            { 'G', terminfo::khome, }, // home
-            { 'O', terminfo::kend, },  // end
-            { 'I', terminfo::kpp, },   // pgup
-            { 'Q', terminfo::knp, },   // pgdn
-            { '\x0e', terminfo::kbks, },// bkspc
-        };
-
-        for (const auto& iter : sc_map)
-        {
-            if (iter.code != key_sc)
-                continue;
-
-            push(iter.seqs[terminfo::keymod_index(key_flags)]);
-            break;
-        }
-
+        push(seqs[terminfo::keymod_index(key_flags)]);
         return;
     }
 
@@ -1095,12 +1104,14 @@ void win_terminal_in::process_input(MOUSE_EVENT_RECORD const& record)
     const bool right_click = !left_click && (!(prv & RIGHTMOST_BUTTON_PRESSED) && (btn & RIGHTMOST_BUTTON_PRESSED));
     const bool double_click = left_click && (record.dwEventFlags & DOUBLE_CLICK);
     const bool wheel = !left_click && !right_click && (record.dwEventFlags & MOUSE_WHEELED);
-    const bool drag = (btn & FROM_LEFT_1ST_BUTTON_PRESSED) && !left_click && !right_click && !wheel && (record.dwEventFlags & MOUSE_MOVED);
+    const bool hwheel = !left_click && !right_click && !wheel && (record.dwEventFlags & MOUSE_HWHEELED);
+    const bool drag = (btn & FROM_LEFT_1ST_BUTTON_PRESSED) && !left_click && !right_click && !wheel && !hwheel && (record.dwEventFlags & MOUSE_MOVED);
 
     const mouse_input_type mask = (left_click ? mouse_input_type::left_click :
                                    right_click ? mouse_input_type::right_click :
                                    double_click ? mouse_input_type::double_click :
                                    wheel ? mouse_input_type::wheel :
+                                   hwheel ? mouse_input_type::hwheel :
                                    drag ? mouse_input_type::drag :
                                    mouse_input_type::none);
 
@@ -1171,6 +1182,21 @@ void win_terminal_in::process_input(MOUSE_EVENT_RECORD const& record)
         if (direction < 0)
             direction = 0 - direction;
         tmp.format("\x1b[$%u%c", direction * int(wheel_scroll_lines), code);
+        push(tmp.c_str());
+        return;
+    }
+
+    // Mouse horizontal wheel.
+    if (hwheel)
+    {
+        int direction = (short(HIWORD(record.dwButtonState))) / 32;
+        UINT hwheel_distance = 1;
+
+        str<16> tmp;
+        const char code = (direction < 0 ? '<' : '>');
+        if (direction < 0)
+            direction = 0 - direction;
+        tmp.format("\x1b[$%u%c", direction * int(hwheel_distance), code);
         push(tmp.c_str());
         return;
     }

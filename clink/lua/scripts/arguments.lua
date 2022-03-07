@@ -20,20 +20,16 @@ end
 
 
 --------------------------------------------------------------------------------
-local function make_dummy_builder()
-    local dummy = {}
-    function dummy:addmatch() end
-    function dummy:addmatches() end
-    function dummy:setappendcharacter() end
-    function dummy:setsuppressappend() end
-    function dummy:setsuppressquoting() end
-    function dummy:setmatchesarefiles() end
-    return dummy
-end
-
---------------------------------------------------------------------------------
 local _argmatcher_fromhistory = {}
 local _argmatcher_fromhistory_root
+local _delayinit_generation = 0
+
+--------------------------------------------------------------------------------
+clink.onbeginedit(function ()
+    _delayinit_generation = _delayinit_generation + 1
+end)
+
+
 
 --------------------------------------------------------------------------------
 local _argreader = {}
@@ -308,16 +304,89 @@ local function apply_options_to_list(addee, list)
     if addee.nosort then
         list.nosort = true
     end
+    if addee.delayinit then
+        if type(addee.delayinit) == "function" then
+            list.delayinit = addee.delayinit
+        end
+    end
     if addee.fromhistory then
         list.fromhistory = true
     end
 end
 
 --------------------------------------------------------------------------------
+local function set_arg_inited(matcher, arg_index, value)
+    if not matcher._inited then
+        matcher._inited = {}
+    end
+    if (matcher._inited[arg_index] or 0) < value then
+        matcher._inited[arg_index] = value
+    end
+end
+
+--------------------------------------------------------------------------------
 local function apply_options_to_builder(reader, arg, builder)
+    -- Disable sorting, if requested.  This goes first because it is
+    -- unconditional and should take effect immediately.
     if arg.nosort then
         builder:setnosort()
     end
+
+    -- Delay initialize the argmatcher, if requested.  But not while generating
+    -- matches from history, as that could be excessively expensive (could run
+    -- thousands of callbacks).  This goes before 'fromhistory' so that when
+    -- invoked from main if it adds 'fromhistory' that will take effect
+    -- immediately.
+    if arg.delayinit and not (_argmatcher_fromhistory and _argmatcher_fromhistory.argmatcher) then
+        local matcher = reader._matcher
+        local argindex = reader._arg_index
+        -- New edit line starts a new generation number.  Reset any delay init
+        -- callbacks that didn't finish.
+        if (matcher._initgen or 0) < _delayinit_generation then
+            if matcher._inited then
+                for i,v in pairs(matcher._inited) do
+                    if v == 1 then
+                        matcher._inited[i] = 0
+                    end
+                end
+            end
+            matcher._initgen = _delayinit_generation
+        end
+        -- Start the delay init callback if it hasn't already started.
+        if not matcher._inited or (matcher._inited[argindex] or 0) < 1 then
+            -- Mark the init callback as started.
+            set_arg_inited(matcher, argindex, 1)
+            local _, ismain = coroutine.running()
+            -- FUTURE: Serialize/chain multiple callbacks?
+            local c = coroutine.create(function ()
+                -- Invoke the delayinit callback and add the results to the arg
+                -- slot's list of matches..
+                local addees = arg.delayinit(matcher, argindex)
+                local list = matcher._args[argindex]
+                if list then
+                    matcher:_add(list, addees)
+                end
+                -- Mark the init callback as finished.
+                set_arg_inited(matcher, argindex, 2)
+                -- If originally started from not-main, then reclassify.
+                if not ismain then
+                    clink.reclassifyline()
+                end
+            end)
+            -- Run the coroutine immediately, if currently in main.
+            if ismain then
+                while true do
+                    coroutine.resume(c)
+                    local status = coroutine.status(c)
+                    if not status or status == "dead" then
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- Generate matches from history, if requested.
     if arg.fromhistory then
         -- Lua/C++/Lua language transition precludes running this in a
         -- coroutine, but also the performance of this might not always be
@@ -356,6 +425,31 @@ end
 --------------------------------------------------------------------------------
 function _argmatcher:getdebugname()
     return self._dbgname or "<unnamed>"
+end
+
+--------------------------------------------------------------------------------
+--- -name:  _argmatcher:reset
+--- -ver:   1.3.10
+--- -ret:   self
+--- Resets the argmatcher to an empty state.  All flags, arguments, and settings
+--- are cleared and reset back to a freshly-created state.
+---
+--- See <a href="#adaptive-argmatchers">Adaptive Argmatchers</a> for more
+--- information.
+function _argmatcher:reset()
+    if self._is_flag_matcher then
+        error("Cannot reset a flag matcher (it is internal and not exposed)")
+    end
+    self._args = {}
+    self._flags = nil
+    self._flagprefix = {}
+    self._descriptions = {}
+    self._nextargindex = 1
+    self._loop = nil
+    self._no_file_generation = nil
+    self._hidden = nil
+    self._classify_func = nil
+    return self
 end
 
 --------------------------------------------------------------------------------
@@ -488,12 +582,41 @@ end
 
 --------------------------------------------------------------------------------
 --- -name:  _argmatcher:setflagprefix
---- -deprecated: _argmatcher:addflags
+--- -ver:   1.0.0
 --- -arg:   [prefixes...:string]
 --- -ret:   self
---- This is no longer needed (and does nothing) because <code>:addflags()</code>
---- automatically identifies.
+--- This is almost never needed, because <code>:addflags()</code> automatically
+--- identifies flag prefix characters.
+---
+--- However, any flags generated by functions can't influence the automatic
+--- flag prefix character(s) detection.  So in some cases it may be necessary to
+--- directly set the flag prefix.
+---
+--- <strong>Note:</strong> <code>:setflagprefix()</code> behaves differently in
+--- different versions of Clink:
+--- <table>
+--- <tr><th>Version</th><th>Description</th></tr>
+--- <tr><td>v1.0.0 through v1.1.3</td><td>Sets the flag prefix characters.</td></tr>
+--- <tr><td>v1.1.4 through v1.2.35</td><td>Only sets flag prefix characters in an argmatcher created using the deprecated <a href="#clink.arg.register_parser">clink.arg.register_parser()</a> function.  Otherwise it has no effect.</td></tr>
+--- <tr><td>v1.2.36 through v1.3.8</td><td>Does nothing.</td></tr>
+--- <tr><td>v1.3.9 onward</td><td>Adds flag prefix characters, in addition to the ones automatically identified.</td></tr>
+--- </table>
+--- -show:  local function make_flags()
+--- -show:  &nbsp;   return { '-a', '-b', '-c' }
+--- -show:  end
+--- -show:
+--- -show:  clink.argmatcher('some_command')
+--- -show:  :addflags(make_flags)   -- Only a function is added, so flag prefix characters cannot be determined automatically.
+--- -show:  :setflagprefix('-')     -- Force '-' to be considered as a flag prefix character.
 function _argmatcher:setflagprefix(...)
+    for _, i in ipairs({...}) do
+        if type(i) ~= "string" or #i ~= 1 then
+            error("Flag prefixes must be single character strings", 2)
+        end
+        if not self._flagprefix[i] or self._flagprefix[i] == 0 then
+            self._flagprefix[i] = 1
+        end
+    end
     return self
 end
 
@@ -610,6 +733,20 @@ end
 --- <a href="#classifywords">Coloring the Input Text</a> for more information.
 function _argmatcher:setclassifier(func)
     self._classify_func = func
+    return self
+end
+
+--------------------------------------------------------------------------------
+--- -name:  _argmatcher:setdelayinit
+--- -ver:   1.3.10
+--- -arg:   func:function
+--- -ret:   self
+--- This registers a function that gets called the first time the argmatcher is
+--- used in each edit line session.  See
+--- <a href="#adaptive-argmatchers">Adaptive Argmatchers</a> for more
+--- information.
+function _argmatcher:setdelayinit(func)
+    self._delayinit_func = func
     return self
 end
 
@@ -857,13 +994,6 @@ function _argmatcher:_generate(line_state, match_builder, extra_words)
                     else
                         m.description = m.description or d[1]
                     end
-                end
-                if is_arg_type and m.match:match("[:=]$") then
-                    -- Do not append a space after an arg type match that ends with
-                    -- a colon or equal sign, because programs typically require
-                    -- flags and args like "--foo=" or "foo=" to have no space after
-                    -- the ":" or "=" symbol.
-                    m.suppressappend = true
                 end
             end
             return m
@@ -1210,6 +1340,20 @@ local function _has_argmatcher(command_word)
 end
 
 --------------------------------------------------------------------------------
+local function _do_onuse_callback(argmatcher)
+    if argmatcher._delayinit_func and (argmatcher._onuse_generation or 0) < _delayinit_generation then
+        argmatcher._onuse_generation = _delayinit_generation
+        -- Run the delayinit callback in a coroutine so typing is responsive.
+        local c = coroutine.create(function ()
+            argmatcher._delayinit_func(argmatcher)
+        end)
+        -- Run the coroutine up to the first yield, so that if it doesn't need
+        -- to yield at all then it completes right now.
+        coroutine.resume(c)
+    end
+end
+
+--------------------------------------------------------------------------------
 -- Finds an argmatcher for the first word and returns:
 --  argmatcher  = The argmatcher, unless there are too few words to use it.
 --  exists      = True if argmatcher exists (even if too few words to use it).
@@ -1230,6 +1374,8 @@ local function _find_argmatcher(line_state, check_existence)
     if argmatcher then
         if check_existence then
             argmatcher = nil
+        elseif argmatcher._delayinit_func then
+            _do_onuse_callback(argmatcher)
         end
         return argmatcher, true
     end
@@ -1246,6 +1392,8 @@ local function _find_argmatcher(line_state, check_existence)
                 if argmatcher then
                     if check_existence then
                         argmatcher = nil
+                    elseif argmatcher._delayinit_func then
+                        _do_onuse_callback(argmatcher)
                     end
                     return argmatcher, true, words
                 end

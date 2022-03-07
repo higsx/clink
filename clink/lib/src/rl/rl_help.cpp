@@ -30,6 +30,7 @@ extern int complete_get_screenwidth(void);
 //------------------------------------------------------------------------------
 extern pager* g_pager;
 extern editor_module::result* g_result;
+extern setting_bool g_terminal_raw_esc;
 extern int ellipsify(const char* in, int limit, str_base& out, bool expand_ctrl);
 extern int read_key_direct(bool wait);
 
@@ -43,6 +44,7 @@ struct Keyentry
     const char* func_name;
     const char* func_desc;
     bool warning;
+    bool prefix;
 };
 
 //------------------------------------------------------------------------------
@@ -384,6 +386,8 @@ static bool translate_keyseq(const char* keyseq, unsigned int len, char** key_na
     int order = 0;
     sort = 0;
 
+    const bool raw_esc = g_terminal_raw_esc.get();
+
     // TODO: Produce identical sort order for both friend names and raw names?
 
     bool first_key = true;
@@ -394,7 +398,7 @@ static bool translate_keyseq(const char* keyseq, unsigned int len, char** key_na
         unsigned int comma_threshold = 0;
         for (unsigned int i = 0; i < len; i++)
         {
-            if (!i && len == 2 && keyseq[0] == 0x1b)
+            if (!i && len == 2 && keyseq[0] == 0x1b && keyseq[1] != 0x1b)
             {
                 comma_threshold++;
                 tmp << "\\M-";
@@ -466,13 +470,16 @@ static bool translate_keyseq(const char* keyseq, unsigned int len, char** key_na
                     if (need_comma > 0)
                         tmp.concat(",", 1);
                     need_comma = 0;
-                    tmp.concat("A-");
-                    eqclass |= 4;
-                    keyseq++;
-                    if (*keyseq >= 'A' && *keyseq <= 'Z')
+                    if (!raw_esc || keyseq[1] != '\x1b')
                     {
-                        tmp.concat("S-");
-                        eqclass |= 1;
+                        tmp.concat("A-");
+                        eqclass |= 4;
+                        keyseq++;
+                        if (*keyseq >= 'A' && *keyseq <= 'Z')
+                        {
+                            tmp.concat("S-");
+                            eqclass |= 1;
+                        }
                     }
                 }
                 if (*keyseq >= 0 && *keyseq < ' ')
@@ -560,9 +567,10 @@ static Keyentry* collect_keymap(
 
     ensure_keydesc_map();
 
-    for (i = 0; i < 256; ++i)
+    for (i = 0; i < KEYMAP_SIZE; ++i)
     {
-        KEYMAP_ENTRY entry = map[i];
+        const bool prefix = (i == ANYOTHERKEY);
+        const KEYMAP_ENTRY& entry = map[i];
         if (entry.function == nullptr)
             continue;
 
@@ -593,7 +601,8 @@ static Keyentry* collect_keymap(
         }
 
         unsigned int old_len = keyseq.length();
-        concat_key_string(i, keyseq);
+        if (!prefix)
+            concat_key_string(i, keyseq);
 
         if (*offset >= *max)
         {
@@ -611,6 +620,7 @@ static Keyentry* collect_keymap(
             else
                 out.macro_text = nullptr;
             out.warning = false;
+            out.prefix = prefix;
 
             if (friendly && warnings && keyseq.length() > 2)
             {
@@ -834,6 +844,21 @@ static void append_key_macro(str_base& s, const char* macro)
 }
 
 //------------------------------------------------------------------------------
+static bool is_keyentry_equivalent(const Keyentry* map, int a, int b)
+{
+    const Keyentry& ka = map[a];
+    const Keyentry& kb = map[b];
+    if (!ka.key_name != !kb.key_name || strcmp(ka.key_name, kb.key_name) != 0)
+        return false;
+    assert(ka.sort == kb.sort);
+    assert(!ka.macro_text == !kb.macro_text && (!ka.macro_text || strcmp(ka.macro_text, kb.macro_text) == 0));
+    assert(!ka.func_name == !kb.func_name && (!ka.func_name || strcmp(ka.func_name, kb.func_name) == 0));
+    assert(!ka.func_desc == !kb.func_desc && (!ka.func_desc || strcmp(ka.func_desc, kb.func_desc) == 0));
+    assert(ka.prefix == kb.prefix);
+    return true;
+}
+
+//------------------------------------------------------------------------------
 struct key_binding_info { str_moveable name; str_moveable binding; const char* desc; const char* cat; };
 void show_key_bindings(bool friendly, int mode, std::vector<key_binding_info>* out=nullptr)
 {
@@ -868,6 +893,30 @@ void show_key_bindings(bool friendly, int mode, std::vector<key_binding_info>* o
 
     // Sort the collected keymap.
     qsort(collector + 1, offset - 1, sizeof(*collector), out ? cmp_sort_collector : cmp_sort_collector_cat);
+
+    // Remove duplicates; these can happen due to ANYOTHERKEY.
+    {
+        Keyentry* tortoise = collector + 1;
+        Keyentry* hare = collector + 1;
+        int num = 1;
+        for (int i = 1; i < offset; ++i)
+        {
+            if (is_keyentry_equivalent(collector, i, i - 1))
+            {
+                free(tortoise->key_name);
+                free(tortoise->macro_text);
+            }
+            else
+            {
+                tortoise++;
+                num++;
+            }
+            hare++;
+            if (tortoise != hare)
+                memcpy(tortoise, hare, sizeof(*hare));
+        }
+        offset = num;
+    }
 
     // Find the longest key name and function name.
     unsigned int longest_key[keycat_MAX] = {};

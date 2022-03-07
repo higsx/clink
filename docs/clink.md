@@ -1093,6 +1093,8 @@ A `:` or `=` at the end of a flag indicates the flag takes an argument but requi
 
 Argument options are not limited solely to strings. Clink also accepts functions too so more context aware argument options can be used.
 
+The function is called each time matches are generated for the argument position.
+
 ```lua
 local function rainbow_function(word)
     return { "red", "white", "blue" }
@@ -1137,6 +1139,92 @@ Match completions are normally listed in sorted order.  In some cases it may be 
 ```lua
 local the_parser = clink.argmatcher()
 the_parser:addarg({ nosort=true, "red", "orange", "yellow", "green", "blue", "indigo", "violet" })
+```
+
+#### Adaptive Argmatchers
+
+Some argmatchers may need to adapt on the fly.  For example, a program may have different features available depending on the current directory, or may want to define its arguments and flags by parsing the `--help` text from running a program.
+
+An argmatcher can define a "delayed initialization" callback function that gets calls when the argmatcher gets used, allowing it to defer potentially expensive initialization work until it's actually needed.  An argmatcher can also define a separate "delayed initialization" function for each argument position.
+
+##### Delayed initialization for the argmatcher
+
+You can use [_argmatcher:setdelayinit()](#_argmatcher:setdelayinit) to define how the argmatcher should perform delayed initialization.
+
+If the definition needs to adapt based on the current directory or other criteria, then the callback function should first test whether the definition needs to change.  If so, first reset the argmatcher and then initialize it.  To reset the argmatcher, use [_argmatcher:reset()](#_argmatcher:reset) which resets it back to an empty, freshly created state.
+
+```lua
+local prev_dir = ""
+
+-- Initialize the argmatcher.
+local function init(argmatcher)
+    local r = io.popen("some_command --help 2>nul")
+    for line in r:lines() do
+        -- PUT PARSING CODE HERE.
+        -- Use the Lua string functions to parse the lines.
+        -- Use argmatcher:addflags(), argmatcher:addarg(), etc to initialize the argmatcher.
+    end
+    r:close()
+end
+
+-- This function has the opportunity to reset and (re)initialize the argmatcher.
+local function ondelayinit(argmatcher)
+    local dir = os.getcwd()
+    if prev_dir ~= dir then  -- When current directory has changed,
+        prev_dir = dir      -- Remember the new current directory,
+        argmatcher:reset()  -- Reset the argmatcher,
+        init(argmatcher)    -- And re-initialize it.
+    end
+end
+
+-- Create the argmatcher and set up delayed initialization.
+local m = clink.argmatcher("some_command")
+if m.setdelayinit then        -- Can't use setdelayinit before Clink v1.3.10.
+    m:setdelayinit(ondelayinit)
+end
+```
+
+##### Delayed initialization for an argument position
+
+If the overall flags and meaning of the argument positions don't need to be updated, and only the possible values need to be updated within certain argument positions, then you can include <code>delayinit=<span class="arg">function</span></code> in the argument table.
+
+The <span class="arg">function</span> should return a table of matches which will be added to the values for the argument position.  The table of matches supports the same syntax as [_argmatcher:addarg()](#_argmatcher:addarg).
+
+The <span class="arg">function</span> is called only once, the first time the argument position is used.  The only way for the function to be called again for that is to use [Delayed initialization for the argmatcher](#delayed-initialization-for-the-argmatcher) and reset the argmatcher and re-initialize it.
+
+This is different from [Functions As Argument Options](#functions-as-argument-options).  The `delayinit` function is called the first time the argmatcher is used, and the results are added to the matches for the rest of the Clink session.  But a function as an argument option is called every time matches are generated for the argument position, and it is never called when applying input line coloring.
+
+```lua
+-- A function to delay-initialize argument values.
+-- This function is used to delay-initialize two different argument positions,
+-- and so it gets called up to two separate times (once for each position where
+-- it is specified).
+-- If the function needs to behave slightly differently for different
+-- argmatchers or argument positions, it can use the two parameters it receives
+-- to identify the specific context in which it is being called.
+local function sc_init_dirs(argmatcher, argindex)
+    return {
+        path.join(os.getenv("USERPROFILE"), "Documents"),
+        path.join(os.getenv("USERPROFILE"), "Pictures")
+    }
+end
+
+-- A function to delay-initialize flag values.
+local function sc_init_flags(argmatcher)
+    -- This calls sc_init_dirs() when the '--dir=' flag is used.
+    return { "--dir=" .. clink.argmatcher():addarg({ delayinit=sc_init_dirs }) }
+end
+
+-- Define an argmatcher with two argument positions, and the second one uses
+-- delayed initialization.
+local m = clink.argmatcher("some_command")
+m:addarg({ "abc", "def", "ghi" })
+m:addarg({ delayinit=sc_init_dirs }) -- This sc_init_dirs() when the second arg position is used.
+
+-- You can also use delayinit with flags, but you must set the flag prefix
+-- character(s) so that Clink can know when to call the delayinit function.
+m:addflags({ delayinit=sc_init_flags })
+m:setflagprefix("-")
 ```
 
 #### Shorthand
@@ -1468,7 +1556,7 @@ A chord can be formed by concatenating multiple key binding sequences. For examp
 
 When finished, press <kbd>Ctrl</kbd>+<kbd>C</kbd> to exit from `clink echo`.
 
-> **Note:** With non-US keyboard layouts, `clink echo` is not able to ignore dead key input (accent keys, for example).  It print the key sequence for the dead key itself, which is not useful.  You can ignore that and press the next key, and then it prints the correct key sequence to use in key bindings.
+> **Note:** With non-US keyboard layouts, `clink echo` is not able to ignore dead key input (accent keys, for example).  It prints the key sequence for the dead key itself, which is not useful.  You can ignore that and press the next key, and then it prints the correct key sequence to use in key bindings.
 
 <a name="specialkeys"></a>
 
@@ -1513,12 +1601,12 @@ When the `terminal.differentiate_keys` setting is enabled then the following key
 |`M` |`\e[27;5;77~`  |`\e[27;6;77~`  |`\em`          |`\eM`          |`\e[27;7;77~`  |`\e[27;8;77~`  |
 |`[` |`\e[27;5;219~` |`\e[27;6;219~` |`\e[27;3;219~` |`\e[27;4;219~` |`\e[27;7;219~` |`\e[27;8;219~` |
 
-The `terminal.raw_esc` setting controls the binding sequence for the <kbd>Esc</kbd> key:
+The `terminal.raw_esc` setting controls the binding sequence for the <kbd>Esc</kbd> key and a couple of other keys:
 
-|`terminal.raw_esc` Setting Value|Key Binding Sequence|
-|:-|-|
-|False (the default)|`\e[27;27~`|
-|True (replicate Unix terminal input quirks and issues)|`\e`|
+|`terminal.raw_esc` Setting Value|Esc|Alt+[|Alt+Shift+O|
+|:-|-|-|-|
+|False (the default)|`\e[27;27~`|`\e[27;3;91~`|`\e[27;4;79~`
+|True (replicate Unix terminal input quirks and issues)|`\e`|`\e[`|`\eO`
 
 <a name="luakeybindings"></a>
 
@@ -1677,56 +1765,56 @@ the current position in the history list.
 <tr><td>
 <code>!</code>
 </td><td>
-     Start a history substitution, except when followed by a space, tab,
-     the end of the line, or <code>=</code>.
+    Start a history substitution, except when followed by a space, tab,
+    the end of the line, or <code>=</code>.
 </td></tr>
 
 <tr><td>
 <code>!<em>n</em></code>
 </td><td>
-     Refer to command line <em>n</em>.
+    Refer to command line <em>n</em>.
 </td></tr>
 
 <tr><td>
 <code>!-<em>n</em></code>
 </td><td>
-     Refer to the command <em>n</em> lines back.
+    Refer to the command <em>n</em> lines back.
 </td></tr>
 
 <tr><td>
 <code>!!</code>
 </td><td>
-     Refer to the previous command.  This is a synonym for <code>!-1</code>.
+    Refer to the previous command.  This is a synonym for <code>!-1</code>.
 </td></tr>
 
 <tr><td>
 <code>!<em>string</em></code>
 </td><td>
-     Refer to the most recent command preceding the current position in
-     the history list starting with <em>string</em>.
+    Refer to the most recent command preceding the current position in
+    the history list starting with <em>string</em>.
 </td></tr>
 
 <tr><td>
 <code>!?<em>string</em>[?]</code>
 </td><td>
-     Refer to the most recent command preceding the current position in
-     the history list containing <em>string</em>.  The trailing <code>?</code> may be
-     omitted if the <em>string</em> is followed immediately by a newline.  If
-     <em>string</em> is missing, the string from the most recent search is used;
-     it is an error if there is no previous search string.
+    Refer to the most recent command preceding the current position in
+    the history list containing <em>string</em>.  The trailing <code>?</code> may be
+    omitted if the <em>string</em> is followed immediately by a newline.  If
+    <em>string</em> is missing, the string from the most recent search is used;
+    it is an error if there is no previous search string.
 </td></tr>
 
 <tr><td>
 <code>^<em>string1</em>^<em>string2</em>^</code>
 </td><td>
-     Quick Substitution.  Repeat the last command, replacing <em>string1</em>
-     with <em>string2</em>.  Equivalent to <code>!!:s^<em>string1</em>^<em>string2</em>^</code>.
+    Quick Substitution.  Repeat the last command, replacing <em>string1</em>
+    with <em>string2</em>.  Equivalent to <code>!!:s^<em>string1</em>^<em>string2</em>^</code>.
 </td></tr>
 
 <tr><td>
 <code>!#</code>
 </td><td>
-     The entire command line typed so far.
+    The entire command line typed so far.
 </td></tr>
 </table>
 
@@ -1739,94 +1827,94 @@ Words are numbered from the beginning of the line, with the first word
 being denoted by 0 (zero).  Words are inserted into the current line
 separated by single spaces.
 
-   For example,
+For example,
 
 <table>
 <tr><td>
 <code>!!</code>
 </td><td>
-     designates the preceding command.  When you type this, the
-     preceding command is repeated in toto.
+    designates the preceding command.  When you type this, the
+    preceding command is repeated in toto.
 </td></tr>
 
 <tr><td>
 <code>!!:$</code>
 </td><td>
-     designates the last argument of the preceding command.  This may be
-     shortened to <code>!$</code>.
+    designates the last argument of the preceding command.  This may be
+    shortened to <code>!$</code>.
 </td></tr>
 
 <tr><td>
 <code>!fi:2</code>
 </td><td>
-     designates the second argument of the most recent command starting
-     with the letters <code>fi</code>.
+    designates the second argument of the most recent command starting
+    with the letters <code>fi</code>.
 </td></tr>
 </table>
 
-   Here are the word designators:
+Here are the word designators:
 
 <table>
 <tr><td>
 <code>0 (zero)</code>
 </td><td>
-     The 0th word.  For many applications, this is the command word.
+    The 0th word.  For many applications, this is the command word.
 </td></tr>
 
 <tr><td>
 <code><em>n</em></code>
 </td><td>
-     The <em>n</em>th word.
+    The <em>n</em>th word.
 </td></tr>
 
 <tr><td>
 <code>^</code>
 </td><td>
-     The first argument; that is, word 1.
+    The first argument; that is, word 1.
 </td></tr>
 
 <tr><td>
 <code>$</code>
 </td><td>
-     The last argument.
+    The last argument.
 </td></tr>
 
 <tr><td>
 <code>%</code>
 </td><td>
-     The first word matched by the most recent <code>!?<em>string</em>?</code> search, if the
-     search string begins with a character that is part of a word.
+    The first word matched by the most recent <code>!?<em>string</em>?</code> search, if the
+    search string begins with a character that is part of a word.
 </td></tr>
 
 <tr><td>
 <code><em>x</em>-<em>y</em></code>
 </td><td>
-     A range of words; <code>-<em>y</em></code> abbreviates <code>0-<em>y</em></code>.
+    A range of words; <code>-<em>y</em></code> abbreviates <code>0-<em>y</em></code>.
 </td></tr>
 
 <tr><td>
 <code>*</code>
 </td><td>
-     All of the words, except the 0th.  This is a synonym for <code>1-$</code>.
-     It is not an error to use <code>*</code> if there is just one word in the
-     event; the empty string is returned in that case.
+    All of the words, except the 0th.  This is a synonym for <code>1-$</code>.
+    It is not an error to use <code>*</code> if there is just one word in the
+    event; the empty string is returned in that case.
 </td></tr>
 
 <tr><td>
 <code><em>x</em>*</code>
 </td><td>
-     Abbreviates <code><em>x</em>-$</code>
+    Abbreviates <code><em>x</em>-$</code>
 </td></tr>
 
 <tr><td>
 <code><em>x</em>-</code>
 </td><td>
-     Abbreviates <code><em>x</em>-$</code> like <code><em>x</em>*</code>, but omits the last word.  If <code><em>x</em></code> is
-     missing, it defaults to 0.
+    Abbreviates <code><em>x</em>-$</code> like <code><em>x</em>*</code>, but omits the last word.  If <code><em>x</em></code> is
+    missing, it defaults to 0.
 </td></tr>
 </table>
 
-   If a word designator is supplied without an event specification, the
+If a word designator is supplied without an event specification, the
 previous command is used as the event.
 
 ### Modifiers
@@ -1839,72 +1927,72 @@ or edit, the word or words selected from the history event.
 <tr><td>
 <code>h</code>
 </td><td>
-     Remove a trailing pathname component, leaving only the head.
+    Remove a trailing pathname component, leaving only the head.
 </td></tr>
 
 <tr><td>
 <code>t</code>
 </td><td>
-     Remove all leading pathname components, leaving the tail.
+    Remove all leading pathname components, leaving the tail.
 </td></tr>
 
 <tr><td>
 <code>r</code>
 </td><td>
-     Remove a trailing suffix of the form <code>.<em>suffix</em></code>, leaving the
-     basename.
+    Remove a trailing suffix of the form <code>.<em>suffix</em></code>, leaving the
+    basename.
 </td></tr>
 
 <tr><td>
 <code>e</code>
 </td><td>
-     Remove all but the trailing suffix.
+    Remove all but the trailing suffix.
 </td></tr>
 
 <tr><td>
 <code>p</code>
 </td><td>
-     Print the new command but do not execute it.
+    Print the new command but do not execute it.
 </td></tr>
 
 <tr><td>
 <code>s/<em>old</em>/<em>new</em>/</code>
 </td><td>
-     Substitute <em>new</em> for the first occurrence of <em>old</em> in the event line.
-     Any character may be used as the delimiter in place of <code>/</code>.  The
-     delimiter may be quoted in <em>old</em> and <em>new</em> with a single backslash.  If
-     <code>&</code> appears in <em>new</em>, it is replaced by <em>old</em>.  A single backslash will
-     quote the <code>&</code>.  If <em>old</em> is null, it is set to the last <em>old</em>
-     substituted, or, if no previous history substitutions took place,
-     the last <em>string</em> in a <code>!?<em>string</em>?</code> search.  If <em>new</em> is is null, each
-     matching <em>old</em> is deleted.  The final delimiter is optional if it is
-     the last character on the input line.
+    Substitute <em>new</em> for the first occurrence of <em>old</em> in the event line.
+    Any character may be used as the delimiter in place of <code>/</code>.  The
+    delimiter may be quoted in <em>old</em> and <em>new</em> with a single backslash.  If
+    <code>&</code> appears in <em>new</em>, it is replaced by <em>old</em>.  A single backslash will
+    quote the <code>&</code>.  If <em>old</em> is null, it is set to the last <em>old</em>
+    substituted, or, if no previous history substitutions took place,
+    the last <em>string</em> in a <code>!?<em>string</em>?</code> search.  If <em>new</em> is is null, each
+    matching <em>old</em> is deleted.  The final delimiter is optional if it is
+    the last character on the input line.
 </td></tr>
 
 <tr><td>
 <code>&</code>
 </td><td>
-     Repeat the previous substitution.
+    Repeat the previous substitution.
 </td></tr>
 
 <tr><td>
 <code>g</code></br>
 </td><td>
-     Cause changes to be applied over the entire event line.  Used in
-     conjunction with <code>s</code>, as in <code>gs/<em>old</em>/<em>new</em>/</code>, or with <code>&</code>.
+    Cause changes to be applied over the entire event line.  Used in
+    conjunction with <code>s</code>, as in <code>gs/<em>old</em>/<em>new</em>/</code>, or with <code>&</code>.
 </td></tr>
 
 <tr><td>
 <code>a</code></br>
 </td><td>
-     The same as <code>g</code>.
+    The same as <code>g</code>.
 </td></tr>
 
 <tr><td>
 <code>G</code>
 </td><td>
-     Apply the following <code>s</code> or <code>&</code> modifier once to each word in the
-     event.
+    Apply the following <code>s</code> or <code>&</code> modifier once to each word in the
+    event.
 </td></tr>
 </table>
 
